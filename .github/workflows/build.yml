@@ -1,0 +1,194 @@
+name: Build Vita3K Plus (Linux ARM64)
+
+# Checks Vita3K Plus (nckstwrt/Vita3K-Plus) once a day. When it has a release this
+# repo hasn't built yet, builds a native Linux ARM64 AppImage and publishes it here.
+on:
+  schedule:
+    - cron: '17 9 * * *'   # every day, 09:17 UTC
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Rebuild even if this version was already built'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM: nckstwrt/Vita3K-Plus
+  QT_VERSION: '6.11.0'
+  SCCACHE_GHA_ENABLED: "true"
+  ASSET: Vita3K-Plus-aarch64.AppImage
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+      tag: ${{ steps.check.outputs.tag }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rel=$(gh api "repos/$UPSTREAM/releases/latest")
+          tag=$(jq -r .tag_name <<<"$rel")
+          # Upstream reuses a tag (e.g. v1.3) for point releases (v1.3.3), so take the
+          # version from the x86_64 AppImage file name when there is one.
+          version=$(jq -r '.assets[].name' <<<"$rel" | grep -oP 'x86_64-\Kv[0-9][0-9.]*(?=\.AppImage$)' | head -1 || true)
+          [ -n "$version" ] || version="$tag"
+          echo "Upstream: tag=$tag version=$version"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "${{ inputs.force }}" = "true" ] || ! gh release view "$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Already built $version - nothing to do."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Get Vita3K Plus source (${{ needs.check.outputs.tag }})
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ needs.check.outputs.tag }}
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Apply fixes for pieces missing from the published source
+        run: |
+          set -euo pipefail
+          # 1) Build-label header the author never committed.
+          if grep -q 'util/fork_build.h' vita3k/util/src/logging.cpp && [ ! -f vita3k/util/include/util/fork_build.h ]; then
+            echo "Adding fork_build.h"
+            printf '%s\n' '#pragma once' '#define FORK_BUILD_SEQ 0' '#define FORK_BUILD_CHANGES ""' > vita3k/util/include/util/fork_build.h
+            grep -q 'RELEASE_VERSION' vita3k/util/src/logging.cpp || echo '#define RELEASE_VERSION true' >> vita3k/util/include/util/fork_build.h
+          fi
+          # 2) Bounds-checked ATRAC9 decode the fork's private LibAtrac9 changes added.
+          H=external/LibAtrac9/C/src/libatrac9.h; C=external/LibAtrac9/C/src/libatrac9.c
+          if grep -rq 'Atrac9DecodeBounded' vita3k && ! grep -q 'Atrac9DecodeBounded' "$H"; then
+            echo "Adding Atrac9DecodeBounded"
+            sed -i 's|^int Atrac9Decode(void\* handle, const unsigned char \*pAtrac9Buffer, short \*pPcmBuffer, int \*pNBytesUsed);|&\nint Atrac9DecodeBounded(void* handle, const unsigned char *pAtrac9Buffer, int nBytesAvailable, short *pPcmBuffer, int *pNBytesUsed);|' "$H"
+            cat >> "$C" <<'EOF'
+
+          int Atrac9DecodeBounded(void* handle, const unsigned char *pAtrac9Buffer, int nBytesAvailable, short *pPcmBuffer, int *pNBytesUsed)
+          {
+          	unsigned char scratch[8192];
+          	const unsigned char *src = pAtrac9Buffer;
+          	int status;
+          	if (nBytesAvailable < 0)
+          		nBytesAvailable = 0;
+          	if (nBytesAvailable < (int)sizeof(scratch)) {
+          		memset(scratch, 0, sizeof(scratch));
+          		if (pAtrac9Buffer && nBytesAvailable > 0)
+          			memcpy(scratch, pAtrac9Buffer, nBytesAvailable);
+          		src = scratch;
+          	}
+          	status = Decode(handle, src, (unsigned char*)pPcmBuffer, pNBytesUsed);
+          	if (status == ERR_SUCCESS && *pNBytesUsed > nBytesAvailable)
+          		return ERR_UNPACK_SUPERFRAME_FLAG_INVALID;
+          	return status;
+          }
+          EOF
+          fi
+
+      - name: Install build dependencies
+        run: bash ./.ci/setup-linux.sh aarch64 with-appimage
+
+      - uses: mozilla-actions/sccache-action@v0.0.10
+        with:
+          disable_annotations: true
+
+      - name: Install Qt ${{ env.QT_VERSION }}
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          modules: qtmultimedia
+          cache: true
+          install-deps: 'true'
+
+      - name: Build AppImage
+        env:
+          VITA3K_LINUXDEPLOY_COMMAND: /usr/local/bin/linuxdeploy-aarch64.AppImage
+        run: |
+          set -euo pipefail
+          cmake --preset ci-linux-clang-appimage
+          cmake --build build/ci-linux-clang-appimage --config Release
+          app=$(find build/ci-linux-clang-appimage -name '*.AppImage' -type f | head -1)
+          [ -n "$app" ] || { echo "No AppImage was produced"; exit 1; }
+          mkdir -p out && cp "$app" "out/$ASSET"
+          sha256sum "out/$ASSET" | tee "out/$ASSET.sha256"
+
+      - name: Create updater scripts
+        run: |
+          set -euo pipefail
+          cat > out/vita3k-plus <<EOF
+          #!/bin/bash
+          # Vita3K Plus launcher with auto-update. Built builds come from: $GITHUB_REPOSITORY
+          REPO="$GITHUB_REPOSITORY"
+          EOF
+          cat >> out/vita3k-plus <<'EOF'
+          ASSET="Vita3K-Plus-aarch64.AppImage"
+          DIR="$HOME/.local/share/vita3k-plus-arm64"
+          APP="$DIR/$ASSET"
+          mkdir -p "$DIR"
+          current=$(cat "$DIR/version" 2>/dev/null)
+          latest=$(curl -fsSL --max-time 10 "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | grep -m1 '"tag_name"' | cut -d'"' -f4)
+          if [ -n "$latest" ] && [ "$latest" != "$current" ]; then
+            echo "Updating Vita3K Plus ${current:-(none)} -> $latest ..."
+            if curl -fL --max-time 900 -o "$APP.new" "https://github.com/$REPO/releases/download/$latest/$ASSET"; then
+              chmod +x "$APP.new" && mv -f "$APP.new" "$APP" && echo "$latest" > "$DIR/version"
+              echo "Updated to $latest."
+            else
+              rm -f "$APP.new"; echo "Update download failed - starting the version you already have."
+            fi
+          fi
+          [ -x "$APP" ] || { echo "Vita3K Plus isn't downloaded yet and the update check failed. Check your internet and try again."; exit 1; }
+          [ "$1" = "--update-only" ] && exit 0
+          exec "$APP" "$@"
+          EOF
+          cat > out/install.sh <<'EOF'
+          #!/bin/bash
+          set -e
+          mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications"
+          tmp=$(mktemp)
+          curl -fsSL "https://github.com/__REPO__/releases/latest/download/vita3k-plus" -o "$tmp"
+          install -m 755 "$tmp" "$HOME/.local/bin/vita3k-plus"; rm -f "$tmp"
+          cat > "$HOME/.local/share/applications/vita3k-plus-arm64.desktop" <<DESK
+          [Desktop Entry]
+          Type=Application
+          Name=Vita3K Plus
+          Comment=PS Vita emulator (auto-updating ARM64 build)
+          Exec=$HOME/.local/bin/vita3k-plus
+          Terminal=false
+          Categories=Game;Emulator;
+          DESK
+          echo "Installed. Start it with: ~/.local/bin/vita3k-plus  (or 'Vita3K Plus' in your app menu)"
+          echo "Downloading the current build now..."
+          "$HOME/.local/bin/vita3k-plus" --update-only
+          echo "Done."
+          EOF
+          sed -i "s|__REPO__|$GITHUB_REPOSITORY|" out/install.sh
+          chmod +x out/vita3k-plus out/install.sh
+
+      - name: Publish release ${{ needs.check.outputs.version }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          notes="Native Linux ARM64 build of Vita3K Plus $VERSION (upstream tag $TAG, commit $(git rev-parse --short HEAD)), built automatically from https://github.com/$UPSTREAM."
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$VERSION" out/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$VERSION" out/* --repo "$GITHUB_REPOSITORY" --title "Vita3K Plus $VERSION (ARM64)" --notes "$notes" --latest
+          fi
