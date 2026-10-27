@@ -2,6 +2,7 @@ name: Build Vita3K Plus (Linux ARM64)
 
 # Checks Vita3K Plus (nckstwrt/Vita3K-Plus) once a day. When it has a release this
 # repo hasn't built yet, builds a native Linux ARM64 AppImage and publishes it here.
+# The AppImage updates itself from this repo's releases each time it starts.
 on:
   schedule:
     - cron: '17 9 * * *'   # every day, 09:17 UTC
@@ -100,6 +101,48 @@ jobs:
           EOF
           fi
 
+      - name: Use the self-updating AppImage launcher
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          cat > appimage/apprun.sh <<'APPRUN_EOF'
+          #!/bin/sh
+          # Vita3K Plus (ARM64) launcher with a built-in updater.
+          # On start it asks GitHub for the newest build in REPO. If that differs from the
+          # version baked into this file, it downloads it, replaces this AppImage in place,
+          # and starts the new one. No internet / any failure -> just starts this version.
+          # Set VITA3K_NO_UPDATE=1 to skip the check.
+          REPO="christianball123/vita3k-plus-arm64"
+          ASSET="Vita3K-Plus-aarch64.AppImage"
+          BUILD_VERSION="__BUILD_VERSION__"
+
+          HERE="$(dirname "$(readlink -f "$0")")"
+          [ -n "$APPDIR" ] || APPDIR="$HERE"
+
+          if [ -n "$APPIMAGE" ] && [ -z "$VITA3K_NO_UPDATE" ] && [ -w "$(dirname "$APPIMAGE")" ] && command -v curl >/dev/null 2>&1; then
+          	latest=$(curl -fsSL --max-time 8 "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | grep -m1 '"tag_name"' | cut -d'"' -f4)
+          	if [ -n "$latest" ] && [ "$latest" != "$BUILD_VERSION" ]; then
+          		echo "Vita3K Plus: updating $BUILD_VERSION -> $latest ..."
+          		tmp="$APPIMAGE.download"
+          		if curl -fL --max-time 900 -o "$tmp" "https://github.com/$REPO/releases/download/$latest/$ASSET" && [ -s "$tmp" ]; then
+          			chmod +x "$tmp" && mv -f "$tmp" "$APPIMAGE" && {
+          				echo "Vita3K Plus: updated to $latest."
+          				export VITA3K_NO_UPDATE=1
+          				exec "$APPIMAGE" "$@"
+          			}
+          		fi
+          		rm -f "$tmp"
+          		echo "Vita3K Plus: update failed, starting $BUILD_VERSION."
+          	fi
+          fi
+
+          export PATH="$APPDIR/usr/bin:$PATH"
+          exec "$APPDIR/usr/bin/Vita3K" "$@"
+          APPRUN_EOF
+          sed -i "s|__BUILD_VERSION__|$VERSION|; s|^REPO=.*|REPO=\"$GITHUB_REPOSITORY\"|" appimage/apprun.sh
+          chmod +x appimage/apprun.sh
+          grep -E "^(REPO|BUILD_VERSION)=" appimage/apprun.sh
+
       - name: Install build dependencies
         run: bash ./.ci/setup-linux.sh aarch64 with-appimage
 
@@ -126,58 +169,6 @@ jobs:
           [ -n "$app" ] || { echo "No AppImage was produced"; exit 1; }
           mkdir -p out && cp "$app" "out/$ASSET"
           sha256sum "out/$ASSET" | tee "out/$ASSET.sha256"
-
-      - name: Create updater scripts
-        run: |
-          set -euo pipefail
-          cat > out/vita3k-plus <<EOF
-          #!/bin/bash
-          # Vita3K Plus launcher with auto-update. Built builds come from: $GITHUB_REPOSITORY
-          REPO="$GITHUB_REPOSITORY"
-          EOF
-          cat >> out/vita3k-plus <<'EOF'
-          ASSET="Vita3K-Plus-aarch64.AppImage"
-          DIR="$HOME/.local/share/vita3k-plus-arm64"
-          APP="$DIR/$ASSET"
-          mkdir -p "$DIR"
-          current=$(cat "$DIR/version" 2>/dev/null)
-          latest=$(curl -fsSL --max-time 10 "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | grep -m1 '"tag_name"' | cut -d'"' -f4)
-          if [ -n "$latest" ] && [ "$latest" != "$current" ]; then
-            echo "Updating Vita3K Plus ${current:-(none)} -> $latest ..."
-            if curl -fL --max-time 900 -o "$APP.new" "https://github.com/$REPO/releases/download/$latest/$ASSET"; then
-              chmod +x "$APP.new" && mv -f "$APP.new" "$APP" && echo "$latest" > "$DIR/version"
-              echo "Updated to $latest."
-            else
-              rm -f "$APP.new"; echo "Update download failed - starting the version you already have."
-            fi
-          fi
-          [ -x "$APP" ] || { echo "Vita3K Plus isn't downloaded yet and the update check failed. Check your internet and try again."; exit 1; }
-          [ "$1" = "--update-only" ] && exit 0
-          exec "$APP" "$@"
-          EOF
-          cat > out/install.sh <<'EOF'
-          #!/bin/bash
-          set -e
-          mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications"
-          tmp=$(mktemp)
-          curl -fsSL "https://github.com/__REPO__/releases/latest/download/vita3k-plus" -o "$tmp"
-          install -m 755 "$tmp" "$HOME/.local/bin/vita3k-plus"; rm -f "$tmp"
-          cat > "$HOME/.local/share/applications/vita3k-plus-arm64.desktop" <<DESK
-          [Desktop Entry]
-          Type=Application
-          Name=Vita3K Plus
-          Comment=PS Vita emulator (auto-updating ARM64 build)
-          Exec=$HOME/.local/bin/vita3k-plus
-          Terminal=false
-          Categories=Game;Emulator;
-          DESK
-          echo "Installed. Start it with: ~/.local/bin/vita3k-plus  (or 'Vita3K Plus' in your app menu)"
-          echo "Downloading the current build now..."
-          "$HOME/.local/bin/vita3k-plus" --update-only
-          echo "Done."
-          EOF
-          sed -i "s|__REPO__|$GITHUB_REPOSITORY|" out/install.sh
-          chmod +x out/vita3k-plus out/install.sh
 
       - name: Publish release ${{ needs.check.outputs.version }}
         env:
